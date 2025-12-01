@@ -2,7 +2,9 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
-    "dev": "nodemon --config nodemon.json"
+    "dev": "nodemon --config nodemon.json",
+    "pm2:start": "npx pm2 start tsx -- src/index.ts",
+    "pm2:stop": "npx pm2 delete tsx"
   },
   "dependencies": {
     "@grammyjs/conversations": "^2.1.0",
@@ -10,7 +12,8 @@
     "cryptr": "^6.4.0",
     "dotenv": "^17.2.3",
     "glob": "^13.0.0",
-    "grammy": "^1.38.3"
+    "grammy": "^1.38.3",
+    "pm2": "^6.0.14"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
