@@ -108,6 +108,19 @@ class NotifierFactory {
 
                 storage.write(ctx.chatId.toString(), ctx.session);
             });
+
+            notifier.emitter.on('poll', async () => {
+                if (!ctx.chatId) {
+                    return;
+                }
+
+                storage.write(ctx.chatId.toString(), ctx.session);
+            });
+
+            if (ctx.session.options.polling) {
+                console.log('Polling enabled in session. Started to poll');
+                notifier.startPollingNotifications();
+            }
         }
 
         const notifier = this.registry.get(ctx.chatId)!;
@@ -181,10 +194,10 @@ class Notifier {
         }
 
         this.controller = new AbortController();
-        let polling = true;
+        this.session.options.polling = true;
 
         const poll = async () => {
-            if (!polling) {
+            if (!this.session.options.polling) {
                 return;
             }
 
@@ -213,7 +226,7 @@ class Notifier {
                 return;
             }
 
-            polling = false;
+            this.session.options.polling = false;
         });
     }
 
