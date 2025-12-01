@@ -69,8 +69,8 @@ type NotifierState = {
         interval: number;
         allowZeroMessages: boolean;
         polling: boolean;
+        pollingOnBoot: boolean;
     };
-    initialized: boolean;
 };
 
 type EventMap = {
@@ -83,67 +83,69 @@ type EventMap = {
     'state:changed': [NotifierState];
 };
 
-type InitialNotifierContext = Pick<NotifierContext, 'chatId' | 'session'>;
-
-function isFullContext(ctx: InitialNotifierContext | NotifierContext): ctx is NotifierContext {
-    return 'reply' in ctx;
-}
-
 class NotifierFactory {
     static registry = new Map<number, Notifier>();
 
-    static create(ctx: InitialNotifierContext | NotifierContext) {
+    static create(ctx: NotifierContext) {
         if (!ctx.chatId) {
             throw new InvalidError('chat id');
         }
 
+        function getSession() {
+            return sessionProxy(ctx.session, () => {
+                if (!ctx.chatId) {
+                    return;
+                }
+
+                storage.write(ctx.chatId.toString(), ctx.session);
+            });
+        }
+
         if (!this.registry.has(ctx.chatId)) {
-            const notifier = new Notifier(() => ctx.session);
+            const notifier = new Notifier(getSession);
             this.registry.set(ctx.chatId, notifier);
-        }
 
-        const notifier = this.registry.get(ctx.chatId)!;
-        notifier.updateSession(() => ctx.session);
+            if (ctx.session.options.pollingOnBoot) {
+                console.log('Polling enabled in session. Started to poll');
+                notifier.startPollingNotifications(true);
 
-        if (ctx.session.options.polling && !isFullContext(ctx)) {
-            console.log('Polling enabled in session. Started to poll');
-            notifier.startPollingNotifications();
+                bot.api.sendMessage(ctx.chatId, 'Continue polling after reboot');
+            }
 
-            bot.api.sendMessage(ctx.chatId, 'Continue polling after reboot');
-        }
-
-        if (isFullContext(ctx) && !ctx.session.initialized) {
             notifier.emitter.on('error', async (error) => {
-                notifier.stopPollingNotifications();
+                notifier.stopPollingNotifications(false);
 
                 await ctx.reply(formatError(error));
             });
 
-            notifier.emitter.on('notification-count:changed', async (count) => {
+            notifier.emitter.on('notification-count', async (count) => {
                 ctx.handleNotificationCount(count);
             });
-
-            notifier.emitter.on('state:changed', async () => {
-                if (!ctx.chatId) {
-                    return;
-                }
-
-                storage.write(ctx.chatId.toString(), ctx.session);
-            });
-
-            notifier.emitter.on('poll', async () => {
-                if (!ctx.chatId) {
-                    return;
-                }
-
-                storage.write(ctx.chatId.toString(), ctx.session);
-            });
-
-            ctx.session.initialized = true;
         }
+
+        const notifier = this.registry.get(ctx.chatId)!;
+        notifier.updateSession(getSession);
 
         return notifier;
     }
+}
+
+function sessionProxy<T extends Record<string, unknown>>(obj: T, trigger: () => void) {
+    return new Proxy<T>(obj, {
+        get(target, p, receiver) {
+            if (target[p as string] instanceof Object) {
+                return sessionProxy(target[p as string] as Record<string, unknown>, trigger);
+            }
+            
+            return Reflect.get(target, p, receiver);
+        },
+        set(target, p, newValue, receiver) {
+            const result = Reflect.set(target, p, newValue, receiver);
+            trigger();
+
+            return result;
+        },
+    });
 }
 
 class Notifier {
@@ -204,8 +206,8 @@ class Notifier {
         }
     }
 
-    public startPollingNotifications() {
-        if (this.session.options.polling) {
+    public startPollingNotifications(force = false) {
+        if (this.session.options.polling && !force) {
             console.warn('Already polling for notifications');
 
             return;
@@ -213,6 +215,7 @@ class Notifier {
 
         this.controller = new AbortController();
         this.session.options.polling = true;
+        this.session.options.pollingOnBoot = true;
 
         const poll = async () => {
             if (!this.session.options.polling) {
@@ -248,7 +251,11 @@ class Notifier {
         });
     }
 
-    public stopPollingNotifications() {
+    public stopPollingNotifications(commit = true) {
+        if (commit) {
+            this.session.options.pollingOnBoot = false;
+        }
+
         this.session.options.polling = false;
 
         this.controller.abort();
@@ -276,10 +283,13 @@ class NotifierContext extends grammy.Context implements grammy.SessionFlavor<Not
     }
 
     get session(): NotifierState {
-        throw new Error("Method not implemented.");
+        // @ts-ignore
+        return super.session;
     }
+
     set session(session: NotifierState) {
-        throw new Error("Method not implemented.");
+        // @ts-ignore
+        super.session = session;
     }
 
     initialize() {
@@ -310,8 +320,8 @@ const DEFAULT_NOTIFIER_STATE: NotifierState = {
         interval: 60_000,
         allowZeroMessages: false,
         polling: false,
+        pollingOnBoot: false,
     },
-    initialized: false,
 };
 
 function createNotifierState() {
@@ -346,15 +356,41 @@ const storage = new CustomFileAdapter<NotifierState>({
 const keys = await storage.getKeys();
 for (const key of keys) {
     const session = await storage.read(key);
-    const ctx: InitialNotifierContext = {
-        chatId: Number(key),
-        session: {
-            ...session,
-            initialized: false,
+    const chatId = Number(key);
+
+    const ctx = new NotifierContext({
+        update_id: 0,
+        message: {
+            message_id: 0,
+            date: 0,
+            chat: {
+                id: chatId,
+                type:'private',
+                title: undefined,
+                first_name: '',
+            },
+            from: {
+                id: 0,
+                is_bot: false,
+                first_name: '',
+            },
         },
-    };
+    }, bot.api, {
+        id: 0,
+        is_bot: true,
+        username: '',
+        can_join_groups: false,
+        can_read_all_group_messages: false,
+        supports_inline_queries: true,
+        can_connect_to_business: false,
+        has_main_web_app: false,
+        first_name: '',
+    });
+    ctx.session = session;
 
     NotifierFactory.create(ctx);
+
+    await bot.api.sendMessage(chatId, 'Bot booted');
 }
 
 bot.use(grammy.session({
