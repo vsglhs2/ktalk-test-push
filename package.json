@@ -9,6 +9,7 @@
     "@grammyjs/storage-file": "^2.5.1",
     "cryptr": "^6.4.0",
     "dotenv": "^17.2.3",
+    "glob": "^13.0.0",
     "grammy": "^1.38.3"
   },
   "devDependencies": {

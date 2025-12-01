@@ -3,6 +3,9 @@ import * as grammy from "grammy";
 import 'dotenv/config';
 import { FileAdapter } from "@grammyjs/storage-file";
 import type { Update, UserFromGetMe } from "grammy/types";
+import { glob } from "glob";
+import path from "node:path";
+
 // import * as conversations from "@grammyjs/conversations";
 
 // const o = globalThis.fetch;
@@ -67,6 +70,7 @@ type NotifierState = {
         allowZeroMessages: boolean;
         polling: boolean;
     };
+    initialized: boolean;
 };
 
 type EventMap = {
@@ -79,10 +83,16 @@ type EventMap = {
     'state:changed': [NotifierState];
 };
 
+type InitialNotifierContext = Pick<NotifierContext, 'chatId' | 'session'>;
+
+function isFullContext(ctx: InitialNotifierContext | NotifierContext): ctx is NotifierContext {
+    return 'reply' in ctx;
+}
+
 class NotifierFactory {
     static registry = new Map<number, Notifier>();
 
-    static create(ctx: NotifierContext) {
+    static create(ctx: InitialNotifierContext | NotifierContext) {
         if (!ctx.chatId) {
             throw new InvalidError('chat id');
         }
@@ -90,7 +100,19 @@ class NotifierFactory {
         if (!this.registry.has(ctx.chatId)) {
             const notifier = new Notifier(() => ctx.session);
             this.registry.set(ctx.chatId, notifier);
+        }
 
+        const notifier = this.registry.get(ctx.chatId)!;
+        notifier.updateSession(() => ctx.session);
+
+        if (ctx.session.options.polling && !isFullContext(ctx)) {
+            console.log('Polling enabled in session. Started to poll');
+            notifier.startPollingNotifications();
+
+            bot.api.sendMessage(ctx.chatId, 'Continue polling after reboot');
+        }
+
+        if (isFullContext(ctx) && !ctx.session.initialized) {
             notifier.emitter.on('error', async (error) => {
                 notifier.stopPollingNotifications();
 
@@ -117,14 +139,8 @@ class NotifierFactory {
                 storage.write(ctx.chatId.toString(), ctx.session);
             });
 
-            if (ctx.session.options.polling) {
-                console.log('Polling enabled in session. Started to poll');
-                notifier.startPollingNotifications();
-            }
+            ctx.session.initialized = true;
         }
-
-        const notifier = this.registry.get(ctx.chatId)!;
-        notifier.updateSession(() => ctx.session);
 
         return notifier;
     }
@@ -190,7 +206,9 @@ class Notifier {
 
     public startPollingNotifications() {
         if (this.session.options.polling) {
-            throw new Error('Already polling for notifications');
+            console.warn('Already polling for notifications');
+
+            return;
         }
 
         this.controller = new AbortController();
@@ -293,6 +311,7 @@ const DEFAULT_NOTIFIER_STATE: NotifierState = {
         allowZeroMessages: false,
         polling: false,
     },
+    initialized: false,
 };
 
 function createNotifierState() {
@@ -303,9 +322,40 @@ const bot = new Bot<NotifierContext>(BOT_TOKEN, {
     ContextConstructor: NotifierContext,
 });
 
-const storage = new FileAdapter<NotifierState>({
+class CustomFileAdapter<T> extends FileAdapter<T> {
+    private dir: string;
+
+    constructor(opts?: ConstructorParameters<typeof FileAdapter<T>>[0]) {
+        super(opts);
+
+        this.dir = opts?.dirName ?? 'sessions';
+    }
+
+    async getKeys() {
+        const resolved = path.resolve(this.dir, '**/*.json');
+        const files =  await glob(resolved);
+
+        return files.map(file => file.split('/').at(-1)!.slice(0, -5));
+    }
+}
+
+const storage = new CustomFileAdapter<NotifierState>({
     dirName: 'sessions',
 });
+
+const keys = await storage.getKeys();
+for (const key of keys) {
+    const session = await storage.read(key);
+    const ctx: InitialNotifierContext = {
+        chatId: Number(key),
+        session: {
+            ...session,
+            initialized: false,
+        },
+    };
+
+    NotifierFactory.create(ctx);
+}
 
 bot.use(grammy.session({
     initial: createNotifierState,
@@ -475,7 +525,7 @@ bot.command(['stop'], async (ctx) => {
 });
 
 bot.command(['settings'], async (ctx) => {
-    ctx.reply(`Referer: ${ctx.session.options.referer}\Token: ${ctx.session.options.token}\Interval: ${ctx.session.options.interval}\n`);
+    ctx.reply(`Referer: ${ctx.session.options.referer}\Token: ${ctx.session.options.token}\Interval: ${ctx.session.options.interval}\nPolling: ${ctx.session.options.polling}`);
 });
 
 bot.command('clear', async (ctx) => {
