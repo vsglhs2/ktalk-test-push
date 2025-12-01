@@ -118,7 +118,7 @@ class NotifierFactory {
                 await ctx.reply(formatError(error));
             });
 
-            notifier.emitter.on('notification-count', async (count) => {
+            notifier.emitter.on('notification-count:changed', async (count) => {
                 ctx.handleNotificationCount(count);
             });
         }
