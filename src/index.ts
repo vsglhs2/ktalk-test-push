@@ -196,7 +196,7 @@ class Notifier {
             });
 
             if (response.status !== 200) {
-                throw new Error('Got non 200 response status');
+                throw new Error(`Got ${response.status} response status`);
             }
 
             return response.json() as Promise<NotificationsCount>;
