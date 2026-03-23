@@ -1,61 +1,15 @@
-import EventEmitter from "node:events";
 import * as grammy from "grammy";
-import 'dotenv/config';
+import "dotenv/config";
 import { FileAdapter } from "@grammyjs/storage-file";
-import type { Update, UserFromGetMe } from "grammy/types";
 import { glob } from "glob";
+import * as http2 from "node:http2";
 import path from "node:path";
 
-// import * as conversations from "@grammyjs/conversations";
-
-// const o = globalThis.fetch;
-
-// globalThis.fetch = function (...args) {
-//     if (typeof args[0] === 'string' && args[0].includes(NOTIFICATION_COUNT_PATH)) {
-//         return Promise.resolve(new Response(JSON.stringify({
-//             rooms_count: 1,
-//         }), {
-//             headers: {
-//                 'Content-Type': 'application/json',
-//             }
-//         }));
-//     }
-
-//     return o.apply(this, args);
-// }
-
-const { Bot } = grammy;
-
-function ensureError(input: unknown) {
-    if (input instanceof Error) {
-        return input;
-    }
-
-    const message = String(input);
-    return new Error(message);
-}
-
-function formatError(error: Error) {
-    return `${error.name}: ${error.message}`;
-}
-
-class InvalidError extends Error {
-    public readonly entity: string;
-
-    constructor(entity: string) {
-        super(`${entity} must be set`);
-
-        this.entity = entity;
-    }
-}
-
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-    throw new InvalidError("bot token");
-}
-
-const BASE_ENDPOINT = 'https://chat.ktalk.ru';
-const NOTIFICATION_COUNT_PATH = `_matrix/client/strangler/api/v1/talk_notifications`;
+const BASE_ENDPOINT = "https://chat.ktalk.ru";
+const NOTIFICATION_COUNT_PATH = "_matrix/client/strangler/api/v1/talk_notifications";
+const DEFAULT_INTERVAL = parsePositiveIntegerOrFallback(process.env.DEFAULT_INTERVAL, 60_000);
+const TELEGRAM_POLL_TIMEOUT = Math.max(1, Math.floor(DEFAULT_INTERVAL / 1000));
+const SHARED_SESSION_KEY = "shared";
 
 type NotificationsCount = {
     rooms_count: number;
@@ -73,241 +27,209 @@ type NotifierState = {
     };
 };
 
-type EventMap = {
-    'stop': [void];
-    'start': [void];
-    'error': [Error];
-    'poll': [boolean];
-    'notification-count': [NotificationsCount];
-    'notification-count:changed': [NotificationsCount];
-    'state:changed': [NotifierState];
+type SessionEndpoint = {
+    providerName: string;
+    targetId: string;
 };
 
-class NotifierFactory {
-    static registry = new Map<number, Notifier>();
+type StoredSessionRecord = {
+    state?: Partial<NotifierState>;
+    endpoints?: SessionEndpoint[];
+};
 
-    static create(ctx: NotifierContext) {
-        if (!ctx.chatId) {
-            throw new InvalidError('chat id');
-        }
+type CommandSummary = {
+    name: string;
+    description: string;
+    usage?: string;
+};
 
-        function getSession() {
-            return sessionProxy(ctx.session, () => {
-                if (!ctx.chatId) {
-                    return;
-                }
+type CommandContext = {
+    providerName: string;
+    targetId: string;
+    args: string;
+    session: NotifierState;
+    notifier: Notifier;
+    reply: (message: string) => Promise<void>;
+    handleNotificationCount: (count: NotificationsCount, showIfZero?: boolean) => Promise<void>;
+    resetSession: () => Promise<void>;
+    commands: readonly CommandSummary[];
+};
 
-                storage.write(ctx.chatId.toString(), ctx.session);
-            });
-        }
+type CommandDefinition = CommandSummary & {
+    run: (ctx: CommandContext) => Promise<void>;
+};
 
-        if (!this.registry.has(ctx.chatId)) {
-            const notifier = new Notifier(getSession);
-            this.registry.set(ctx.chatId, notifier);
+type InboundCommand = {
+    providerName: string;
+    targetId: string;
+    name: string;
+    args: string;
+    reply: (message: string) => Promise<void>;
+};
 
-            if (ctx.session.options.pollingOnBoot) {
-                console.log('Polling enabled in session. Started to poll');
-                notifier.startPollingNotifications(true);
+type MessagingProvider = {
+    readonly name: string;
+    readonly label: string;
+    start: (onCommand: (command: InboundCommand) => Promise<void>) => Promise<void>;
+    sendMessage: (targetId: string, message: string) => Promise<void>;
+};
 
-                bot.api.sendMessage(ctx.chatId, 'Continue polling after reboot');
-            }
+type NotifierBinding = {
+    key: string;
+    getSession: () => NotifierState;
+    reply: (message: string) => Promise<void>;
+    handleNotificationCount: (count: NotificationsCount) => Promise<void>;
+};
 
-            notifier.emitter.on('error', async (error) => {
-                notifier.stopPollingNotifications(false);
+type NtfyEvent = {
+    event?: string;
+    message?: string;
+    topic?: string;
+};
 
-                await ctx.reply(formatError(error));
-            });
+class InvalidError extends Error {
+    public readonly entity: string;
 
-            notifier.emitter.on('notification-count:changed', async (count) => {
-                ctx.handleNotificationCount(count);
-            });
-        }
-
-        const notifier = this.registry.get(ctx.chatId)!;
-        notifier.updateSession(getSession);
-
-        return notifier;
+    constructor(entity: string) {
+        super(`${entity} must be set`);
+        this.entity = entity;
     }
 }
 
-function sessionProxy<T extends Record<string, unknown>>(obj: T, trigger: () => void) {
+function ensureError(input: unknown) {
+    if (input instanceof Error) {
+        return input;
+    }
+
+    return new Error(String(input));
+}
+
+function formatError(error: Error) {
+    return `${error.name}: ${error.message}`;
+}
+
+function isAbortError(error: Error) {
+    return error.name === "AbortError";
+}
+
+function parsePositiveIntegerOrFallback(input: string | undefined, fallback: number) {
+    const value = Number(input);
+
+    if (Number.isInteger(value) && value > 0) {
+        return value;
+    }
+
+    return fallback;
+}
+
+function parsePositiveInteger(input: string, label: string) {
+    const value = Number(input);
+
+    if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`${label} must be a positive integer`);
+    }
+
+    return value;
+}
+
+function parseBooleanInput(input: string) {
+    const normalized = input.trim().toLowerCase();
+
+    if (!normalized) {
+        return true;
+    }
+
+    if (["1", "true", "yes", "on"].includes(normalized)) {
+        return true;
+    }
+
+    if (["0", "false", "no", "off"].includes(normalized)) {
+        return false;
+    }
+
+    throw new Error("Allow must be one of: true, false, on, off, 1, 0");
+}
+
+function maskSecret(secret: string | null) {
+    if (!secret) {
+        return "unset";
+    }
+
+    if (secret.length <= 8) {
+        return `${secret[0]}***${secret[secret.length - 1]}`;
+    }
+
+    return `${secret.slice(0, 4)}...${secret.slice(-4)}`;
+}
+
+function sleep(ms: number) {
+    return new Promise<void>((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+
+function requireTextArg(input: string, label: string) {
+    const value = input.trim();
+
+    if (!value) {
+        throw new InvalidError(label);
+    }
+
+    return value;
+}
+
+function parseCommandText(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) {
+        return null;
+    }
+
+    const withoutSlash = trimmed.slice(1);
+    if (!withoutSlash) {
+        return null;
+    }
+
+    const [rawName, ...rest] = withoutSlash.split(/\s+/);
+    const name = rawName.split("@")[0]?.toLowerCase();
+    if (!name) {
+        return null;
+    }
+
+    return {
+        name,
+        args: rest.join(" ").trim(),
+    };
+}
+
+function createTopicUrl(baseUrl: string, topic: string, suffix = "") {
+    const normalized = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+    return new URL(`${encodeURIComponent(topic)}${suffix}`, normalized).toString();
+}
+
+function sessionProxy<T extends object>(obj: T, trigger: () => void): T {
     return new Proxy<T>(obj, {
-        get(target, p, receiver) {
-            if (target[p as string] instanceof Object) {
-                return sessionProxy(target[p as string] as Record<string, unknown>, trigger);
+        get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver);
+
+            if (value && typeof value === "object") {
+                return sessionProxy(value as object, trigger);
             }
-            
-            return Reflect.get(target, p, receiver);
+
+            return value;
         },
-        set(target, p, newValue, receiver) {
-            const result = Reflect.set(target, p, newValue, receiver);
+        set(target, property, newValue, receiver) {
+            const result = Reflect.set(target, property, newValue, receiver);
+            trigger();
+
+            return result;
+        },
+        deleteProperty(target, property) {
+            const result = Reflect.deleteProperty(target, property);
             trigger();
 
             return result;
         },
     });
-}
-
-class Notifier {
-    private controller: AbortController;
-    private getSession: () => NotifierState;
-
-    private get session() {
-        return this.getSession();
-    }
-
-    public readonly emitter: EventEmitter<EventMap>;
-
-    constructor(getSession: () => NotifierState) {
-        this.controller = new AbortController();
-        this.getSession = getSession;
-
-        this.emitter = new EventEmitter();
-
-        this.emitter.on('notification-count:changed', () => {
-            this.emitter.emit('state:changed', this.session);
-        });
-    }
-
-    public updateSession(getSession: () => NotifierState) {
-        this.getSession = getSession;
-    }
-
-    public async getNotificationCount(): Promise<NotificationsCount> {
-        const url = `${BASE_ENDPOINT}/${NOTIFICATION_COUNT_PATH}`;
-        const referer = this.session.options.referer;
-
-        if (!referer) {
-            throw new InvalidError('referer');
-        }
-
-        if (!this.session.options.token) {
-            throw new InvalidError('token');
-        }
-
-        try {
-            const response = await fetch(url, {
-                headers: {
-                    'Referer': referer,
-                    'Origin': referer,
-                    'Talk-Token': this.session.options.token,
-                },
-                signal: this.controller.signal,
-            });
-
-            if (response.status !== 200) {
-                throw new Error(`Got ${response.status} response status`);
-            }
-
-            return response.json() as Promise<NotificationsCount>;
-        } catch (error) {
-            // TODO: handle network issues here
-            throw error;
-        }
-    }
-
-    public startPollingNotifications(force = false) {
-        if (this.session.options.polling && !force) {
-            console.warn('Already polling for notifications');
-
-            return;
-        }
-
-        this.controller = new AbortController();
-        this.session.options.polling = true;
-        this.session.options.pollingOnBoot = true;
-
-        const poll = async () => {
-            if (!this.session.options.polling) {
-                return;
-            }
-
-            try {
-                const data = await this.getNotificationCount();
-                console.log('polled', data);
-                this.emitter.emit('notification-count', data);
-                
-                if (data.rooms_count != this.session.count.rooms_count) {
-                    this.emitter.emit('notification-count:changed', data);
-                }
-
-                this.session.count = data;
-
-                setTimeout(poll, this.session.options.interval);
-            } catch (error) {
-                this.emitter.emit('error', ensureError(error));
-            }
-        }
-
-        poll();
-        this.emitter.emit('poll', true);
-
-        this.emitter.once('poll', (polling: boolean) => {
-            if (polling) {
-                return;
-            }
-
-            this.session.options.polling = false;
-        });
-    }
-
-    public stopPollingNotifications(commit = true) {
-        if (commit) {
-            this.session.options.pollingOnBoot = false;
-        }
-
-        this.session.options.polling = false;
-
-        this.controller.abort();
-        this.controller = new AbortController();
-
-        this.emitter.emit('poll', false);
-    }
-}
-
-class NotifierContext extends grammy.Context implements grammy.SessionFlavor<NotifierState> {
-    #notifier: Notifier | null;
-
-    public get notifier() {
-        if (!this.#notifier) {
-            throw new InvalidError('notifier');
-        }
-
-        return this.#notifier;
-    }
-
-    constructor(update: Update, api: grammy.Api, me: UserFromGetMe) {
-        super(update, api, me);
-
-        this.#notifier = null;
-    }
-
-    get session(): NotifierState {
-        // @ts-ignore
-        return super.session;
-    }
-
-    set session(session: NotifierState) {
-        // @ts-ignore
-        super.session = session;
-    }
-
-    initialize() {
-        this.#notifier = NotifierFactory.create(this);
-    }
-
-    async handleNotificationCount(
-        count: NotificationsCount,
-        showIfZero = false
-    ) {
-        if (!showIfZero && !this.session.options.allowZeroMessages && count.rooms_count === 0) {
-            return;
-        }
-
-        const message = `${count.rooms_count} rooms have new messages`;
-        await this.reply(message);
-    }
-
 }
 
 const DEFAULT_NOTIFIER_STATE: NotifierState = {
@@ -317,7 +239,7 @@ const DEFAULT_NOTIFIER_STATE: NotifierState = {
     options: {
         token: null,
         referer: null,
-        interval: 60_000,
+        interval: DEFAULT_INTERVAL,
         allowZeroMessages: false,
         polling: false,
         pollingOnBoot: false,
@@ -328,267 +250,967 @@ function createNotifierState() {
     return structuredClone(DEFAULT_NOTIFIER_STATE);
 }
 
-const bot = new Bot<NotifierContext>(BOT_TOKEN, {
-    ContextConstructor: NotifierContext,
-});
+function isStoredSessionRecord(input: unknown): input is StoredSessionRecord {
+    return input !== null && typeof input === "object" && ("state" in input || "endpoints" in input);
+}
 
-class CustomFileAdapter<T> extends FileAdapter<T> {
-    private dir: string;
+function normalizeSessionEndpoints(input: SessionEndpoint[] | undefined) {
+    if (!input) {
+        return [];
+    }
 
-    constructor(opts?: ConstructorParameters<typeof FileAdapter<T>>[0]) {
-        super(opts);
+    const endpoints = new Map<string, SessionEndpoint>();
 
-        this.dir = opts?.dirName ?? 'sessions';
+    for (const endpoint of input) {
+        if (typeof endpoint?.providerName !== "string" || typeof endpoint?.targetId !== "string") {
+            continue;
+        }
+
+        const providerName = endpoint.providerName.trim();
+        const targetId = endpoint.targetId.trim();
+        if (!providerName || !targetId) {
+            continue;
+        }
+
+        endpoints.set(`${providerName}:${targetId}`, {
+            providerName,
+            targetId,
+        });
+    }
+
+    return Array.from(endpoints.values());
+}
+
+function normalizeNotifierState(input: Partial<NotifierState> | undefined) {
+    const state = createNotifierState();
+
+    if (!input) {
+        return state;
+    }
+
+    if (typeof input.count?.rooms_count === "number" && Number.isFinite(input.count.rooms_count)) {
+        state.count.rooms_count = input.count.rooms_count;
+    }
+
+    if (!input.options) {
+        return state;
+    }
+
+    if (typeof input.options.token === "string" || input.options.token === null) {
+        state.options.token = input.options.token;
+    }
+
+    if (typeof input.options.referer === "string" || input.options.referer === null) {
+        state.options.referer = input.options.referer;
+    }
+
+    if (typeof input.options.interval === "number" && Number.isInteger(input.options.interval) && input.options.interval > 0) {
+        state.options.interval = input.options.interval;
+    }
+
+    if (typeof input.options.allowZeroMessages === "boolean") {
+        state.options.allowZeroMessages = input.options.allowZeroMessages;
+    }
+
+    if (typeof input.options.polling === "boolean") {
+        state.options.polling = input.options.polling;
+    }
+
+    if (typeof input.options.pollingOnBoot === "boolean") {
+        state.options.pollingOnBoot = input.options.pollingOnBoot;
+    }
+
+    return state;
+}
+
+class SessionFileAdapter<T> extends FileAdapter<T> {
+    private readonly dir: string;
+
+    constructor(dirName = "sessions") {
+        super({ dirName });
+        this.dir = dirName;
     }
 
     async getKeys() {
-        const resolved = path.resolve(this.dir, '**/*.json');
-        const files =  await glob(resolved);
+        const resolved = path.resolve(this.dir, "**/*.json");
+        const files = await glob(resolved);
 
-        return files.map(file => file.split('/').at(-1)!.slice(0, -5));
+        return files.map((file) => path.basename(file, ".json"));
     }
 }
 
-const storage = new CustomFileAdapter<NotifierState>({
-    dirName: 'sessions',
-});
+class SessionStore {
+    private readonly storage = new SessionFileAdapter<StoredSessionRecord | Partial<NotifierState>>("sessions");
 
-const keys = await storage.getKeys();
-for (const key of keys) {
-    const session = await storage.read(key);
-    const chatId = Number(key);
+    private parseLegacyKey(key: string) {
+        const separator = key.indexOf("__");
+        if (separator === -1) {
+            return {
+                providerName: "telegram",
+                targetId: key,
+            };
+        }
 
-    const ctx = new NotifierContext({
-        update_id: 0,
-        message: {
-            message_id: 0,
-            date: 0,
-            chat: {
-                id: chatId,
-                type:'private',
-                title: undefined,
-                first_name: '',
+        return {
+            providerName: key.slice(0, separator),
+            targetId: decodeURIComponent(key.slice(separator + 2)),
+        };
+    }
+
+    private async readLegacy() {
+        const keys = (await this.storage.getKeys()).filter((key) => key !== SHARED_SESSION_KEY);
+        if (keys.length === 0) {
+            return null;
+        }
+
+        const entries = await Promise.all(keys.map(async (key) => {
+            const stored = await this.storage.read(key);
+
+            return {
+                endpoint: this.parseLegacyKey(key),
+                state: normalizeNotifierState(isStoredSessionRecord(stored) ? stored.state : stored),
+            };
+        }));
+        const preferred = entries.find((entry) => entry.endpoint.providerName === "telegram") ?? entries[0];
+
+        return {
+            state: preferred.state,
+            endpoints: normalizeSessionEndpoints(entries.map((entry) => entry.endpoint)),
+        };
+    }
+
+    async read() {
+        const stored = await this.storage.read(SHARED_SESSION_KEY);
+        if (stored) {
+            if (isStoredSessionRecord(stored)) {
+                return {
+                    state: normalizeNotifierState(stored.state),
+                    endpoints: normalizeSessionEndpoints(stored.endpoints),
+                };
+            }
+
+            return {
+                state: normalizeNotifierState(stored),
+                endpoints: [],
+            };
+        }
+
+        const migrated = await this.readLegacy();
+        if (!migrated) {
+            return {
+                state: createNotifierState(),
+                endpoints: [],
+            };
+        }
+
+        await this.write(migrated);
+        return migrated;
+    }
+
+    async write(record: StoredSessionRecord) {
+        await this.storage.write(SHARED_SESSION_KEY, {
+            state: normalizeNotifierState(record.state),
+            endpoints: normalizeSessionEndpoints(record.endpoints),
+        });
+    }
+}
+
+class Notifier {
+    private controller = new AbortController();
+    private binding: NotifierBinding;
+
+    constructor(binding: NotifierBinding) {
+        this.binding = binding;
+    }
+
+    private get session() {
+        return this.binding.getSession();
+    }
+
+    public updateBinding(binding: NotifierBinding) {
+        this.binding = binding;
+    }
+
+    public async getNotificationCount(): Promise<NotificationsCount> {
+        const referer = this.session.options.referer;
+        const token = this.session.options.token;
+
+        if (!referer) {
+            throw new InvalidError("referer");
+        }
+
+        if (!token) {
+            throw new InvalidError("token");
+        }
+
+        const response = await fetch(`${BASE_ENDPOINT}/${NOTIFICATION_COUNT_PATH}`, {
+            headers: {
+                Referer: referer,
+                Origin: referer,
+                "Talk-Token": token,
             },
-            from: {
-                id: 0,
-                is_bot: false,
-                first_name: '',
+            signal: this.controller.signal,
+        });
+
+        if (response.status !== 200) {
+            throw new Error(`Got ${response.status} response status`);
+        }
+
+        const data = await response.json() as Partial<NotificationsCount>;
+        if (typeof data.rooms_count !== "number" || !Number.isFinite(data.rooms_count)) {
+            throw new Error("Invalid notifications count response");
+        }
+
+        return {
+            rooms_count: data.rooms_count,
+        };
+    }
+
+    public startPollingNotifications(force = false) {
+        if (this.session.options.polling && !force) {
+            console.warn(`[${this.binding.key}] already polling`);
+            return false;
+        }
+
+        this.controller.abort();
+        this.controller = new AbortController();
+        this.session.options.polling = true;
+        this.session.options.pollingOnBoot = true;
+
+        void this.poll();
+
+        return true;
+    }
+
+    private async poll(): Promise<void> {
+        if (!this.session.options.polling) {
+            return;
+        }
+
+        try {
+            const data = await this.getNotificationCount();
+            const hasChanged = data.rooms_count !== this.session.count.rooms_count;
+
+            this.session.count = data;
+
+            if (hasChanged) {
+                await this.binding.handleNotificationCount(data);
+            }
+        } catch (error) {
+            const resolved = ensureError(error);
+            if (isAbortError(resolved) && !this.session.options.polling) {
+                return;
+            }
+
+            this.stopPollingNotifications(false);
+            await this.binding.reply(formatError(resolved));
+            return;
+        }
+
+        if (!this.session.options.polling) {
+            return;
+        }
+
+        setTimeout(() => {
+            void this.poll();
+        }, this.session.options.interval);
+    }
+
+    public stopPollingNotifications(commit = true) {
+        const wasPolling = this.session.options.polling;
+
+        if (commit) {
+            this.session.options.pollingOnBoot = false;
+        }
+
+        this.session.options.polling = false;
+        this.controller.abort();
+        this.controller = new AbortController();
+
+        return wasPolling;
+    }
+}
+
+class NotifierFactory {
+    private static readonly registry = new Map<string, Notifier>();
+
+    static create(binding: NotifierBinding) {
+        if (!this.registry.has(binding.key)) {
+            const notifier = new Notifier(binding);
+            this.registry.set(binding.key, notifier);
+
+            if (binding.getSession().options.pollingOnBoot) {
+                console.log(`[${binding.key}] restoring polling after reboot`);
+                notifier.startPollingNotifications(true);
+                void binding.reply("Continue polling after reboot");
+            }
+        }
+
+        const notifier = this.registry.get(binding.key)!;
+        notifier.updateBinding(binding);
+
+        return notifier;
+    }
+}
+
+class Conversation {
+    private rawSession: NotifierState;
+    private proxiedSession: NotifierState;
+    private saveQueue: Promise<void> = Promise.resolve();
+    private providers: Map<string, MessagingProvider>;
+    private readonly endpoints = new Map<string, SessionEndpoint>();
+
+    public readonly key = SHARED_SESSION_KEY;
+    public readonly notifier: Notifier;
+
+    constructor(
+        initialState: NotifierState,
+        initialEndpoints: SessionEndpoint[],
+        private readonly store: SessionStore,
+        providers: Map<string, MessagingProvider>,
+    ) {
+        this.rawSession = initialState;
+        this.proxiedSession = this.createSessionProxy();
+        this.providers = providers;
+
+        for (const endpoint of initialEndpoints) {
+            this.endpoints.set(this.createEndpointKey(endpoint.providerName, endpoint.targetId), endpoint);
+        }
+
+        this.notifier = NotifierFactory.create(this.createBinding());
+    }
+
+    private createEndpointKey(providerName: string, targetId: string) {
+        return `${providerName}:${targetId}`;
+    }
+
+    private createSessionProxy() {
+        return sessionProxy(this.rawSession, () => {
+            void this.persist();
+        });
+    }
+
+    private createBinding(): NotifierBinding {
+        return {
+            key: this.key,
+            getSession: () => this.session,
+            reply: (message) => this.reply(message),
+            handleNotificationCount: (count) => this.handleNotificationCount(count),
+        };
+    }
+
+    private async persist() {
+        const snapshot: StoredSessionRecord = {
+            state: structuredClone(this.rawSession),
+            endpoints: Array.from(this.endpoints.values()),
+        };
+
+        this.saveQueue = this.saveQueue
+            .catch(() => undefined)
+            .then(async () => {
+                await this.store.write(snapshot);
+            });
+
+        await this.saveQueue;
+    }
+
+    public updateProviders(providers: Map<string, MessagingProvider>) {
+        this.providers = providers;
+        this.notifier.updateBinding(this.createBinding());
+    }
+
+    public hasEndpoints() {
+        return this.endpoints.size > 0;
+    }
+
+    public async connect(providerName: string, targetId: string) {
+        const key = this.createEndpointKey(providerName, targetId);
+        if (this.endpoints.has(key)) {
+            return;
+        }
+
+        this.endpoints.set(key, { providerName, targetId });
+        await this.persist();
+    }
+
+    public get session() {
+        return this.proxiedSession;
+    }
+
+    public async reply(message: string) {
+        const endpoints = Array.from(this.endpoints.values());
+        if (endpoints.length === 0) {
+            return;
+        }
+
+        const results = await Promise.allSettled(endpoints.map((endpoint) => this.replyTo(endpoint.providerName, endpoint.targetId, message)));
+        for (const result of results) {
+            if (result.status === "fulfilled") {
+                continue;
+            }
+
+            console.error(`[session] ${formatError(ensureError(result.reason))}`);
+        }
+    }
+
+    public async replyTo(providerName: string, targetId: string, message: string) {
+        const provider = this.providers.get(providerName);
+        if (!provider) {
+            throw new Error(`Provider "${providerName}" is not configured`);
+        }
+
+        await provider.sendMessage(targetId, message);
+    }
+
+    public async handleNotificationCount(count: NotificationsCount, showIfZero = false) {
+        if (!showIfZero && !this.session.options.allowZeroMessages && count.rooms_count === 0) {
+            return;
+        }
+
+        await this.reply(`${count.rooms_count} rooms have new messages`);
+    }
+
+    public async resetSession() {
+        this.notifier.stopPollingNotifications(false);
+        this.rawSession = createNotifierState();
+        this.proxiedSession = this.createSessionProxy();
+        this.notifier.updateBinding(this.createBinding());
+        await this.persist();
+    }
+}
+
+class ConversationManager {
+    private conversation: Conversation | null = null;
+
+    constructor(
+        private readonly store: SessionStore,
+        private readonly providers: Map<string, MessagingProvider>,
+    ) {}
+
+    private async ensureConversation() {
+        if (!this.conversation) {
+            const stored = await this.store.read();
+            this.conversation = new Conversation(stored.state, stored.endpoints, this.store, this.providers);
+        }
+
+        this.conversation.updateProviders(this.providers);
+        return this.conversation;
+    }
+
+    async get(providerName: string, targetId: string) {
+        const provider = this.providers.get(providerName);
+
+        if (!provider) {
+            throw new Error(`Provider \"${providerName}\" is not configured`);
+        }
+
+        const conversation = await this.ensureConversation();
+        await conversation.connect(providerName, targetId);
+
+        return conversation;
+    }
+
+    async restoreAll() {
+        const conversation = await this.ensureConversation();
+        if (!conversation.hasEndpoints()) {
+            return [];
+        }
+
+        return [conversation];
+    }
+}
+
+class CommandRouter {
+    private readonly commandMap = new Map<string, CommandDefinition>();
+    private readonly commands: readonly CommandSummary[];
+
+    constructor(
+        private readonly conversations: ConversationManager,
+        commands: readonly CommandDefinition[],
+    ) {
+        this.commands = commands.map(({ name, description, usage }) => ({
+            name,
+            description,
+            usage,
+        }));
+
+        for (const command of commands) {
+            this.commandMap.set(command.name, command);
+        }
+    }
+
+    async handle(inbound: InboundCommand) {
+        const command = this.commandMap.get(inbound.name);
+        if (!command) {
+            await inbound.reply(`Unknown command: /${inbound.name}. Send /start for help.`);
+            return;
+        }
+
+        try {
+            const conversation = await this.conversations.get(inbound.providerName, inbound.targetId);
+
+            await command.run({
+                providerName: inbound.providerName,
+                targetId: inbound.targetId,
+                args: inbound.args,
+                session: conversation.session,
+                notifier: conversation.notifier,
+                reply: (message) => conversation.replyTo(inbound.providerName, inbound.targetId, message),
+                handleNotificationCount: (count, showIfZero = false) => conversation.handleNotificationCount(count, showIfZero),
+                resetSession: () => conversation.resetSession(),
+                commands: this.commands,
+            });
+        } catch (error) {
+            await inbound.reply(formatError(ensureError(error)));
+        }
+    }
+}
+
+class TelegramProvider implements MessagingProvider {
+    public readonly name = "telegram";
+    public readonly label = "Telegram";
+
+    private readonly bot: grammy.Bot;
+    private readonly commands: readonly CommandSummary[];
+
+    constructor(token: string, commands: readonly CommandSummary[]) {
+        this.bot = new grammy.Bot(token);
+        this.commands = commands;
+    }
+
+    async start(onCommand: (command: InboundCommand) => Promise<void>) {
+        this.bot.on("message:text", async (ctx) => {
+            if (!ctx.chatId) {
+                return;
+            }
+
+            const command = parseCommandText(ctx.message.text);
+            if (!command) {
+                return;
+            }
+
+            await onCommand({
+                providerName: this.name,
+                targetId: String(ctx.chatId),
+                name: command.name,
+                args: command.args,
+                reply: async (message) => {
+                    await ctx.reply(message);
+                },
+            });
+        });
+
+        this.bot.catch(async (error) => {
+            console.error(error.error);
+
+            if (!error.ctx.chatId) {
+                return;
+            }
+
+            await this.sendMessage(String(error.ctx.chatId), formatError(ensureError(error.error)));
+        });
+
+        await this.bot.api.setMyCommands(this.commands.map(({ name, description }) => ({
+            command: name,
+            description,
+        })));
+
+        void this.bot.start({
+            timeout: TELEGRAM_POLL_TIMEOUT,
+        }).catch((error) => {
+            console.error(formatError(ensureError(error)));
+        });
+    }
+
+    async sendMessage(targetId: string, message: string) {
+        await this.bot.api.sendMessage(Number(targetId), message);
+    }
+}
+
+type NtfyProviderOptions = {
+    baseUrl: string;
+    topic: string;
+    title: string;
+    authorization: string | null;
+    reconnectDelayMs: number;
+    idleTimeoutMs: number;
+};
+
+class NtfyProvider implements MessagingProvider {
+    public readonly name = "ntfy";
+    public readonly label = "ntfy";
+
+    constructor(private readonly options: NtfyProviderOptions) {}
+
+    private log(message: string) {
+        console.log(`[ntfy:${this.options.topic}] ${message}`);
+    }
+
+    private createHeaders(extra: Record<string, string> = {}) {
+        const headers = new Headers(extra);
+
+        if (this.options.authorization) {
+            headers.set("Authorization", this.options.authorization);
+        }
+
+        return headers;
+    }
+
+    private async handleLine(line: string, onCommand: (command: InboundCommand) => Promise<void>) {
+        let event: NtfyEvent;
+
+        try {
+            event = JSON.parse(line) as NtfyEvent;
+        } catch (error) {
+            this.log(`ignoring malformed event: ${formatError(ensureError(error))}`);
+            return;
+        }
+
+        if (event.event !== "message" || typeof event.message !== "string" || typeof event.topic !== "string") {
+            return;
+        }
+
+        const command = parseCommandText(event.message);
+        if (!command) {
+            return;
+        }
+
+        const topic = event.topic;
+
+        await onCommand({
+            providerName: this.name,
+            targetId: topic,
+            name: command.name,
+            args: command.args,
+            reply: (message) => this.sendMessage(topic, message),
+        });
+    }
+
+    private createSubscribeHeaders(url: URL) {
+        const headers: Record<string, string> = {
+            ":method": "GET",
+            ":path": `${url.pathname}${url.search}`,
+        };
+
+        if (this.options.authorization) {
+            headers.authorization = this.options.authorization;
+        }
+
+        return headers;
+    }
+
+    private createIdleMonitor(request: http2.ClientHttp2Stream, session: http2.ClientHttp2Session) {
+        let timeout: NodeJS.Timeout | null = null;
+
+        const refresh = () => {
+            if (timeout) {
+                clearTimeout(timeout);
+            }
+
+            timeout = setTimeout(() => {
+                const error = new Error(`ntfy stream health check failed after ${this.options.idleTimeoutMs} ms without activity`);
+                request.destroy(error);
+                session.destroy();
+            }, this.options.idleTimeoutMs);
+            timeout.unref();
+        };
+
+        const stop = () => {
+            if (!timeout) {
+                return;
+            }
+
+            clearTimeout(timeout);
+            timeout = null;
+        };
+
+        refresh();
+
+        return {
+            refresh,
+            stop,
+        };
+    }
+
+    private async consumeStream(onCommand: (command: InboundCommand) => Promise<void>) {
+        const streamUrl = new URL(createTopicUrl(this.options.baseUrl, this.options.topic, "/json"));
+        const session = http2.connect(streamUrl.origin);
+        const request = session.request(this.createSubscribeHeaders(streamUrl));
+
+        session.on("error", (error) => {
+            request.destroy(ensureError(error));
+        });
+
+        request.setEncoding("utf8");
+
+        const status = await new Promise<number>((resolve, reject) => {
+            request.once("response", (headers) => {
+                resolve(Number(headers[":status"] ?? 0));
+            });
+            request.once("error", reject);
+            session.once("error", reject);
+        });
+
+        if (status < 200 || status >= 300) {
+            request.close();
+            session.close();
+            throw new Error(`ntfy subscribe failed with ${status || "unknown status"}`);
+        }
+
+        this.log("subscription connected");
+
+        const idleMonitor = this.createIdleMonitor(request, session);
+        let buffer = "";
+
+        try {
+            for await (const chunk of request) {
+                idleMonitor.refresh();
+                buffer += chunk;
+
+                let newlineIndex = buffer.indexOf("\n");
+                while (newlineIndex !== -1) {
+                    const line = buffer.slice(0, newlineIndex).trim();
+                    buffer = buffer.slice(newlineIndex + 1);
+
+                    if (line) {
+                        await this.handleLine(line, onCommand);
+                    }
+
+                    newlineIndex = buffer.indexOf("\n");
+                }
+            }
+        } finally {
+            idleMonitor.stop();
+            request.close();
+            session.close();
+        }
+
+        const remainder = buffer.trim();
+        if (remainder) {
+            await this.handleLine(remainder, onCommand);
+        }
+    }
+
+    private async listen(onCommand: (command: InboundCommand) => Promise<void>) {
+        while (true) {
+            try {
+                await this.consumeStream(onCommand);
+                this.log(`subscription closed, reconnecting in ${this.options.reconnectDelayMs} ms`);
+            } catch (error) {
+                this.log(`${formatError(ensureError(error))}; reconnecting in ${this.options.reconnectDelayMs} ms`);
+            }
+
+            await sleep(this.options.reconnectDelayMs);
+        }
+    }
+
+    async start(onCommand: (command: InboundCommand) => Promise<void>) {
+        void this.listen(onCommand);
+    }
+
+    async sendMessage(targetId: string, message: string) {
+        const response = await fetch(createTopicUrl(this.options.baseUrl, targetId), {
+            method: "POST",
+            headers: this.createHeaders({
+                Title: this.options.title,
+            }),
+            body: message,
+        });
+
+        if (!response.ok) {
+            throw new Error(`ntfy publish failed with ${response.status}`);
+        }
+    }
+}
+
+function createHelpMessage(commands: readonly CommandSummary[]) {
+    const lines = commands.map((command) => {
+        const usage = command.usage ? ` ${command.usage}` : "";
+        return `/${command.name}${usage} - ${command.description}`;
+    });
+
+    return ["Available commands:", ...lines].join("\n");
+}
+
+function formatSettings(ctx: CommandContext) {
+    return [
+        `Provider: ${ctx.providerName}`,
+        `Target: ${ctx.targetId}`,
+        `Referer: ${ctx.session.options.referer ?? "unset"}`,
+        `Token: ${maskSecret(ctx.session.options.token)}`,
+        `Interval: ${ctx.session.options.interval} ms`,
+        `Allow zero messages: ${ctx.session.options.allowZeroMessages}`,
+        `Polling: ${ctx.session.options.polling}`,
+        `Polling on boot: ${ctx.session.options.pollingOnBoot}`,
+    ].join("\n");
+}
+
+async function validateNotifierConfiguration(ctx: CommandContext) {
+    if (ctx.session.options.token && ctx.session.options.referer) {
+        await ctx.notifier.getNotificationCount();
+    }
+}
+
+function createCommands(): CommandDefinition[] {
+    return [
+        {
+            name: "start",
+            description: "Show available commands",
+            run: async (ctx) => {
+                await ctx.reply(createHelpMessage(ctx.commands));
             },
         },
-    }, bot.api, {
-        id: 0,
-        is_bot: true,
-        username: '',
-        can_join_groups: false,
-        can_read_all_group_messages: false,
-        supports_inline_queries: true,
-        can_connect_to_business: false,
-        has_main_web_app: false,
-        first_name: '',
-    });
-    ctx.session = session;
+        {
+            name: "check",
+            description: "Check notifications right now",
+            run: async (ctx) => {
+                const count = await ctx.notifier.getNotificationCount();
+                ctx.session.count = count;
+                await ctx.handleNotificationCount(count, true);
+            },
+        },
+        {
+            name: "poll",
+            description: "Start notifications polling",
+            run: async (ctx) => {
+                const started = ctx.notifier.startPollingNotifications();
+                await ctx.reply(started ? "Polling started" : "Polling is already running");
+            },
+        },
+        {
+            name: "stop",
+            description: "Stop notifications polling",
+            run: async (ctx) => {
+                const stopped = ctx.notifier.stopPollingNotifications();
+                await ctx.reply(stopped ? "Polling stopped" : "Polling is already stopped");
+            },
+        },
+        {
+            name: "interval",
+            description: "Change polling interval",
+            usage: "<ms>",
+            run: async (ctx) => {
+                ctx.session.options.interval = parsePositiveInteger(requireTextArg(ctx.args, "interval"), "interval");
+                await ctx.reply(`Interval successfully set to ${ctx.session.options.interval} ms`);
+            },
+        },
+        {
+            name: "token",
+            description: "Change token used for polling",
+            usage: "<value>",
+            run: async (ctx) => {
+                const token = requireTextArg(ctx.args, "token");
+                const previous = ctx.session.options.token;
 
-    NotifierFactory.create(ctx);
+                ctx.session.options.token = token;
 
-    await bot.api.sendMessage(chatId, 'Bot booted');
+                try {
+                    await validateNotifierConfiguration(ctx);
+                } catch (error) {
+                    ctx.session.options.token = previous;
+                    throw error;
+                }
+
+                await ctx.reply("Token successfully set");
+            },
+        },
+        {
+            name: "referer",
+            description: "Change referer used for polling",
+            usage: "<url>",
+            run: async (ctx) => {
+                const referer = requireTextArg(ctx.args, "referer");
+                const previous = ctx.session.options.referer;
+
+                ctx.session.options.referer = referer;
+
+                try {
+                    await validateNotifierConfiguration(ctx);
+                } catch (error) {
+                    ctx.session.options.referer = previous;
+                    throw error;
+                }
+
+                await ctx.reply("Referer successfully set");
+            },
+        },
+        {
+            name: "allow",
+            description: "Show zero count messages during polling",
+            usage: "[true|false]",
+            run: async (ctx) => {
+                ctx.session.options.allowZeroMessages = parseBooleanInput(ctx.args);
+                await ctx.reply(`Allow zero messages successfully set to ${ctx.session.options.allowZeroMessages}`);
+            },
+        },
+        {
+            name: "settings",
+            description: "Show current settings",
+            run: async (ctx) => {
+                await ctx.reply(formatSettings(ctx));
+            },
+        },
+        {
+            name: "clear",
+            description: "Clear your session",
+            run: async (ctx) => {
+                await ctx.resetSession();
+                await ctx.reply("Successfully cleared session");
+            },
+        },
+    ];
 }
 
-bot.use(grammy.session({
-    initial: createNotifierState,
-    storage: storage,
-}))
+function createProviders(commands: readonly CommandSummary[]) {
+    const providers: MessagingProvider[] = [];
+    const telegramToken = process.env.TELEGRAM_BOT_TOKEN ?? process.env.BOT_TOKEN;
+    const ntfyTopic = process.env.NTFY_TOPIC?.trim();
 
-bot.use(async (ctx: NotifierContext, next: grammy.NextFunction) => {
-    ctx.initialize();
-
-    next();
-});
-
-bot.command(['token'], async (ctx) => {
-    ctx.session.options.token = ctx.match;
-
-    await ctx.notifier.getNotificationCount();
-    await ctx.reply('Token successfully set');
-});
-
-bot.command(['referer'], async (ctx) => {
-    ctx.session.options.referer = ctx.match;
-
-    await ctx.reply('Referer successfully set');
-});
-
-bot.command(['allow'], async (ctx) => {
-    ctx.session.options.allowZeroMessages = Boolean(ctx.match);
-
-    await ctx.reply('Allow zero messages successfully set');
-});
-
-bot.command(['interval'], async (ctx) => {
-    const interval = Number(ctx.match);
-    if (Number.isNaN(interval) && interval > 0) {
-        throw new Error('Interval must be a non negative number > 0');
+    if (telegramToken) {
+        providers.push(new TelegramProvider(telegramToken, commands));
     }
 
-    ctx.session.options.interval = interval;
-
-    await ctx.reply('Interval successfully set');
-});
-
-bot.command(['check'], async (ctx) => {
-    const count = await ctx.notifier.getNotificationCount();
-    ctx.session.count.rooms_count = count.rooms_count;
-    
-    await ctx.handleNotificationCount(count, true);
-});
-
-bot.command(['start'], async (ctx) => {
-    const keyboard = new grammy.InlineKeyboard()
-        .text("Check", "check-p")
-        .text("Settings", "settings-p");
-
-    await ctx.reply('Hello', {
-        reply_markup: keyboard,
-    });
-
-});
-
-// bot.use(conversations.conversations());
-
-// bot.use(conversations.createConversation(settings));
-
-// async function handleSettingChange(
-//     conversation: conversations.Conversation<NotifierContext, NotifierContext>,
-//     ctx: NotifierContext,
-//     key: keyof NotifierState['options'],
-// ) {
-//     const session = await conversation.external(() => {
-//         return ctx.session;
-//     })
-//     await ctx.editMessageText(`${key}: [${session.options[key]}]`);
-
-//     await ctx.editMessageReplyMarkup({
-//         reply_markup: undefined,
-//     });
-
-//     const { message } = await conversation.waitFor('message');
-//     console.log(message.text);
-// }
-
-// async function settings(
-//     conversation: conversations.Conversation<NotifierContext, NotifierContext>,
-//     ctx: NotifierContext
-// ) {
-//     const keyboard = new grammy.InlineKeyboard()
-//         .text("Interval", "set-interval")
-//         .text("Referer", "set-referer")
-//         .text("Token", "set-token").row()
-//         .text("Allow showing zero messages", "set-showZeroMessages");
-
-//     await ctx.editMessageText("Settings");
-
-//     await ctx.editMessageReplyMarkup({
-//         reply_markup: keyboard,
-//     });
-
-//     const ctx2 = await conversation.waitForCallbackQuery(/set-.+/);
-//     ctx2.reply(ctx2.match.toString());
-
-//     const key = ctx2.match.toString().split('set-')[1] as keyof NotifierState['options'];
-//     await handleSettingChange(conversation, ctx, key);
-
-//     await ctx.editMessageText("Settings");
-
-//     await ctx.editMessageReplyMarkup({
-//         reply_markup: keyboard,
-//     });
-// }
-
-// bot.callbackQuery("set-show-zero-messages-true", async (ctx) => {
-//     ctx.session.options.allowZeroMessages = true;
-
-//     await ctx.answerCallbackQuery({
-//         text: "Done!",
-//     });
-// });
-
-// bot.callbackQuery("set-show-zero-messages-false", async (ctx) => {
-//     ctx.session.options.allowZeroMessages = false;
-
-//     await ctx.answerCallbackQuery({
-//         text: "Done!",
-//     });
-// });
-
-// bot.callbackQuery("set-show-zero-messages", async (ctx) => {
-//     const keyboard = new grammy.InlineKeyboard()
-//         .text("True", "set-show-zero-messages-true")
-//         .text("False", "set-show-zero-messages-false");
-
-//     await ctx.editMessageText("Set show zero messages: " + ctx.session.options.allowZeroMessages);
-
-//     await ctx.editMessageReplyMarkup({
-//         reply_markup: keyboard,
-//     });
-
-//     // await ctx.answerCallbackQuery({
-//     //     text: "",
-//     // });
-// });
-
-// bot.callbackQuery("check-p", async (ctx) => {
-//     const count = await ctx.notifier.getNotificationCount();
-//     await ctx.handleNotificationCount(count, true);
-//     await ctx.answerCallbackQuery({
-//         text: "Done!",
-//     });
-// });
-
-// bot.callbackQuery("settings-p", async (ctx) => {
-//     await ctx.conversation.enter('settings');
-//     const count = await ctx.notifier.getNotificationCount();
-//     await ctx.handleNotificationCount(count, true);
-//     await ctx.answerCallbackQuery({
-//         text: "Done!",
-//     });
-// });
-
-bot.command(['poll'], async (ctx) => {
-    ctx.notifier.startPollingNotifications();
-});
-
-bot.command(['stop'], async (ctx) => {
-    ctx.notifier.stopPollingNotifications();
-});
-
-bot.command(['settings'], async (ctx) => {
-    ctx.reply(`Referer: ${ctx.session.options.referer}\Token: ${ctx.session.options.token}\Interval: ${ctx.session.options.interval}\nPolling: ${ctx.session.options.polling}`);
-});
-
-bot.command('clear', async (ctx) => {
-    ctx.session = createNotifierState();
-
-    ctx.reply('Successfully cleared session');
-});
-
-bot.api.setMyCommands([
-    { command: 'poll', description: 'Start notifications polling' },
-    { command: 'stop', description: 'Stop notifications polling' },
-    { command: 'interval', description: 'Change interval of notifications polling' },
-    { command: 'token', description: 'Change token using with the notifications polling' },
-    { command: 'referer', description: 'Change referer using with the notifications polling' },
-    { command: 'settings', description: 'Show current settings' },
-    { command: 'clear', description: 'Clear your session' },
-    { command: 'allow', description: 'Show zero count messages during the notifications polling' },
-]);
-
-bot.start({
-    timeout: process.env.DEFAULT_INTERVAL ?? 60_000,
-});
-
-bot.catch(async (error) => {
-    if (!error.ctx.chatId) {
-        return;
+    if (ntfyTopic) {
+        providers.push(new NtfyProvider({
+            baseUrl: process.env.NTFY_BASE_URL?.trim() || "https://ntfy.sh",
+            topic: ntfyTopic,
+            title: process.env.NTFY_TITLE?.trim() || "KTalk Push",
+            authorization: process.env.NTFY_AUTHORIZATION?.trim() || null,
+            reconnectDelayMs: 3_000,
+            idleTimeoutMs: 120_000,
+        }));
     }
 
-    await error.ctx.reply(formatError(error));
+    if (providers.length === 0) {
+        throw new Error("Configure at least one provider: TELEGRAM_BOT_TOKEN/BOT_TOKEN or NTFY_TOPIC");
+    }
+
+    return providers;
+}
+
+async function main() {
+    const commands = createCommands();
+    const commandSummaries = commands.map(({ name, description, usage }) => ({
+        name,
+        description,
+        usage,
+    }));
+    const providers = createProviders(commandSummaries);
+    const providerMap = new Map(providers.map((provider) => [provider.name, provider]));
+    const store = new SessionStore();
+    const conversations = new ConversationManager(store, providerMap);
+    const router = new CommandRouter(conversations, commands);
+
+    for (const provider of providers) {
+        await provider.start((command) => router.handle(command));
+    }
+
+    for (const conversation of await conversations.restoreAll()) {
+        await conversation.reply("Service booted");
+    }
+}
+
+void main().catch((error) => {
+    console.error(formatError(ensureError(error)));
+    process.exitCode = 1;
 });
