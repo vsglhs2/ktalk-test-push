@@ -26,6 +26,9 @@ type NotifierState = {
         polling: boolean;
         pollingOnBoot: boolean;
     };
+    lastError?: string;
+    errorMessageId?: string;
+    consecutiveErrorCount?: number;
 };
 
 type SessionEndpoint = {
@@ -50,7 +53,7 @@ type CommandContext = {
     args: string;
     session: NotifierState;
     notifier: Notifier;
-    reply: (message: string) => Promise<void>;
+    reply: (message: string) => Promise<void | { message_id?: number }>;
     handleNotificationCount: (count: NotificationsCount, showIfZero?: boolean) => Promise<void>;
     resetSession: () => Promise<void>;
     commands: readonly CommandSummary[];
@@ -72,13 +75,15 @@ type MessagingProvider = {
     readonly name: string;
     readonly label: string;
     start: (onCommand: (command: InboundCommand) => Promise<void>) => Promise<void>;
-    sendMessage: (targetId: string, message: string) => Promise<void>;
+    sendMessage: (targetId: string, message: string) => Promise<void | { message_id?: number }>;
+    editMessage?: (targetId: string, messageId: number, text: string) => Promise<void> | void;
 };
 
 type NotifierBinding = {
     key: string;
     getSession: () => NotifierState;
-    reply: (message: string) => Promise<void>;
+    reply: (message: string) => Promise<{ message_id?: number } | void>;
+    editMessage?: (messageId: string, text: string) => Promise<void>;
     handleNotificationCount: (count: NotificationsCount) => Promise<void>;
 };
 
@@ -246,6 +251,9 @@ const DEFAULT_NOTIFIER_STATE: NotifierState = {
         polling: false,
         pollingOnBoot: false,
     },
+    lastError: undefined,
+    errorMessageId: undefined,
+    consecutiveErrorCount: 0,
 };
 
 function createNotifierState() {
@@ -489,33 +497,51 @@ class Notifier {
             return;
         }
 
-        try {
-            const data = await this.getNotificationCount();
-            const hasChanged = data.rooms_count !== this.session.count.rooms_count;
+        let errorMessageId: string | undefined;
+        let consecutiveErrors = 0;
 
-            this.session.count = data;
+        while (this.session.options.polling) {
+            try {
+                const data = await this.getNotificationCount();
+                const hasChanged = data.rooms_count !== this.session.count.rooms_count;
 
-            if (hasChanged) {
-                await this.binding.handleNotificationCount(data);
+                this.session.count = data;
+
+                if (hasChanged) {
+                    await this.binding.handleNotificationCount(data);
+                }
+            } catch (error) {
+                const resolved = ensureError(error);
+                
+                if (isAbortError(resolved) && !this.session.options.polling) {
+                    return;
+                }
+
+                consecutiveErrors++;
+                const errorMessage = `Polling error [${consecutiveErrors}]${formatError(resolved)}`;
+                this.session.lastError = errorMessage;
+                this.session.consecutiveErrorCount = consecutiveErrors;
+
+                if (errorMessageId) {
+                    await this.binding.editMessage?.(errorMessageId, errorMessage);
+                } else {
+                    const response = await this.binding.reply(errorMessage);
+                    const messageId = (response as any)?.message_id;
+                    if (messageId) {
+                        errorMessageId = messageId.toString();
+                        this.session.errorMessageId = errorMessageId;
+                    }
+                }
+
+                await sleep(this.session.options.interval);
+                continue;
             }
-        } catch (error) {
-            const resolved = ensureError(error);
-            if (isAbortError(resolved) && !this.session.options.polling) {
-                return;
-            }
 
-            this.stopPollingNotifications(false);
-            await this.binding.reply(formatError(resolved));
-            return;
+            errorMessageId = this.session.errorMessageId;
+            consecutiveErrors = 0;
+
+            await sleep(this.session.options.interval);
         }
-
-        if (!this.session.options.polling) {
-            return;
-        }
-
-        setTimeout(() => {
-            void this.poll();
-        }, this.session.options.interval);
     }
 
     public stopPollingNotifications(commit = true) {
@@ -549,8 +575,12 @@ class NotifierFactory {
         }
 
         const notifier = this.registry.get(binding.key)!;
-        notifier.updateBinding(binding);
+        return notifier;
+    }
 
+    static updateBinding(binding: NotifierBinding): Notifier {
+        const notifier = NotifierFactory.registry.get(binding.key)!;
+notifier.updateBinding(binding);
         return notifier;
     }
 }
@@ -592,13 +622,37 @@ class Conversation {
         });
     }
 
-    private createBinding(): NotifierBinding {
+private createBinding(): NotifierBinding {
+        if (this.endpoints.size === 0) {
+            throw new Error("No endpoints configured for conversation");
+        }
+
+        const activeEndpoint = Array.from(this.endpoints.values())[0];
+
         return {
             key: this.key,
             getSession: () => this.session,
-            reply: (message) => this.reply(message),
+            reply: (message) => this.replyTo(activeEndpoint.providerName, activeEndpoint.targetId, message),
+            editMessage: async (messageId: string, text: string) => {
+                const provider = this.providers.get(activeEndpoint.providerName);
+                if (!provider) {
+                    throw new Error(`Provider "${activeEndpoint.providerName}" is not configured`);
+                }
+                await this.editReply(activeEndpoint.providerName, activeEndpoint.targetId, parseFloat(messageId), text);
+            },
             handleNotificationCount: (count) => this.handleNotificationCount(count),
         };
+    }
+
+    private async editReply(_providerName: string, targetId: string, messageId: number, text: string) {
+        const provider = this.providers.get(_providerName);
+        if (!provider) {
+            throw new Error(`Provider "${_providerName}" is not configured`);
+        }
+
+        if (provider.editMessage) {
+            await provider.editMessage(targetId, messageId, text);
+        }
     }
 
     private async persist() {
@@ -648,7 +702,7 @@ class Conversation {
         const results = await Promise.allSettled(endpoints.map((endpoint) => this.replyTo(endpoint.providerName, endpoint.targetId, message)));
         for (const result of results) {
             if (result.status === "fulfilled") {
-                continue;
+                return result.value;
             }
 
             console.error(`[session] ${formatError(ensureError(result.reason))}`);
@@ -661,7 +715,7 @@ class Conversation {
             throw new Error(`Provider "${providerName}" is not configured`);
         }
 
-        await provider.sendMessage(targetId, message);
+        return await provider.sendMessage(targetId, message);
     }
 
     public async handleNotificationCount(count: NotificationsCount, showIfZero = false) {
@@ -829,7 +883,12 @@ class TelegramProvider implements MessagingProvider {
     }
 
     async sendMessage(targetId: string, message: string) {
-        await this.bot.api.sendMessage(Number(targetId), message);
+        const sent = await this.bot.api.sendMessage(Number(targetId), message);
+        return { message_id: sent.message_id };
+    }
+
+    async editMessage(targetId: string, messageId: number, text: string) {
+        await this.bot.api.editMessageText(Number(targetId), messageId, text);
     }
 }
 
@@ -1026,6 +1085,12 @@ class NtfyProvider implements MessagingProvider {
         if (!response.ok) {
             throw new Error(`ntfy publish failed with ${response.status}`);
         }
+
+        return;
+    }
+
+    editMessage(_targetId: string, _messageId: number, _text: string) {
+        throw new Error("ntfy does not support editing messages");
     }
 }
 
