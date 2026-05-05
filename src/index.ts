@@ -7,7 +7,7 @@ import * as http2 from "node:http2";
 import path from "node:path";
 
 const BASE_ENDPOINT = "https://chat.ktalk.ru";
-const NOTIFICATION_COUNT_PATH = "_matrix/client/strangler/api/v1/talk_notifications";
+const NOTIFICATION_COUNT_PATH = "_matrix/client/read/api/v1/talk_notifications";
 const DEFAULT_INTERVAL = parsePositiveIntegerOrFallback(process.env.DEFAULT_INTERVAL, 60_000);
 const TELEGRAM_POLL_TIMEOUT = Math.max(1, Math.floor(DEFAULT_INTERVAL / 1000));
 const SHARED_SESSION_KEY = "shared";
@@ -133,8 +133,9 @@ function parsePositiveInteger(input: string, label: string) {
     return value;
 }
 
-function parseBooleanInput(input: string) {
-    const normalized = input.trim().toLowerCase();
+function parseBooleanInput(input?: string) {
+    const value = input ?? "true";
+    const normalized = value.trim().toLowerCase();
 
     if (!normalized) {
         return true;
@@ -691,7 +692,8 @@ class ConversationManager {
     private async ensureConversation() {
         if (!this.conversation) {
             const stored = await this.store.read();
-            this.conversation = new Conversation(stored.state, stored.endpoints, this.store, this.providers);
+            const validEndpoints = stored.endpoints.filter((endpoint) => this.providers.get(endpoint.providerName));
+            this.conversation = new Conversation(stored.state, validEndpoints, this.store, this.providers);
         }
 
         this.conversation.updateProviders(this.providers);
@@ -1170,12 +1172,11 @@ function createProviders(commands: readonly CommandSummary[]) {
     const telegramToken = process.env.TELEGRAM_BOT_TOKEN ?? process.env.BOT_TOKEN;
     const ntfyTopic = process.env.NTFY_TOPIC?.trim();
 
-    if (telegramToken) {
+if (telegramToken) {
         const proxyUrl = process.env.TELEGRAM_PROXY?.trim();
         providers.push(new TelegramProvider(telegramToken, commands, proxyUrl));
     }
-
-    if (ntfyTopic) {
+    if (ntfyTopic && parseBooleanInput(process.env.NTFY_ENABLED)) {
         providers.push(new NtfyProvider({
             baseUrl: process.env.NTFY_BASE_URL?.trim() || "https://ntfy.sh",
             topic: ntfyTopic,
