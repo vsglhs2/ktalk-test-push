@@ -13,6 +13,7 @@
     "dotenv": "^17.2.3",
     "glob": "^13.0.0",
     "grammy": "^1.38.3",
+    "https-proxy-agent": "^9.0.0",
     "pm2": "^6.0.14"
   },
   "devDependencies": {

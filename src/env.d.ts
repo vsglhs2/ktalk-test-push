@@ -3,6 +3,7 @@ declare global {
 	interface ProcessEnv {
 		BOT_TOKEN?: string;
 		TELEGRAM_BOT_TOKEN?: string;
+		TELEGRAM_PROXY?: string;
 		DEFAULT_INTERVAL?: string;
 		NTFY_BASE_URL?: string;
 		NTFY_TOPIC?: string;

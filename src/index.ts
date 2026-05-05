@@ -2,6 +2,7 @@ import * as grammy from "grammy";
 import "dotenv/config";
 import { FileAdapter } from "@grammyjs/storage-file";
 import { glob } from "glob";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import * as http2 from "node:http2";
 import path from "node:path";
 
@@ -773,8 +774,11 @@ class TelegramProvider implements MessagingProvider {
     private readonly bot: grammy.Bot;
     private readonly commands: readonly CommandSummary[];
 
-    constructor(token: string, commands: readonly CommandSummary[]) {
-        this.bot = new grammy.Bot(token);
+    constructor(token: string, commands: readonly CommandSummary[], proxyUrl?: string) {
+        const client: grammy.ApiClientOptions | undefined = proxyUrl
+            ? { baseFetchConfig: { agent: new HttpsProxyAgent(proxyUrl) } }
+            : undefined;
+        this.bot = new grammy.Bot(token, { client });
         this.commands = commands;
     }
 
@@ -1167,7 +1171,8 @@ function createProviders(commands: readonly CommandSummary[]) {
     const ntfyTopic = process.env.NTFY_TOPIC?.trim();
 
     if (telegramToken) {
-        providers.push(new TelegramProvider(telegramToken, commands));
+        const proxyUrl = process.env.TELEGRAM_PROXY?.trim();
+        providers.push(new TelegramProvider(telegramToken, commands, proxyUrl));
     }
 
     if (ntfyTopic) {
